@@ -1,4 +1,3 @@
-# server.py
 from flask import Flask, request, jsonify, send_from_directory
 import os, json, base64
 from datetime import datetime
@@ -140,7 +139,6 @@ def objects_summary_from(flags, persons):
 
 
 def describe_event_like(persons, objs, severity):
-    """Same caption logic used for events and live status."""
     has_weapon = objs["weapon"]
     has_box = objs["box"]
     num_people = objs["person_count"]
@@ -199,10 +197,6 @@ def next_id() -> int:
 
 
 def handle_frame(frame: Dict[str, Any]) -> None:
-    """
-    1 frame in  ->  0/1 event appended to event_history
-    Also updates last_status (live state, captions, threat flag, snapshots).
-    """
     global event_history, last_status, known_person_ids, dangerous_persons
 
     ts = parse_iso(frame["timestamp"])
@@ -300,7 +294,6 @@ def handle_frame(frame: Dict[str, Any]) -> None:
             last_status["threat_name"] = synthetic
             dangerous_persons.add(synthetic)
 
-        # severity → dashboard flags
         if severity == "danger":
             last_status["danger"] = True
         elif severity == "attention" and not last_status["danger"]:
@@ -325,13 +318,13 @@ def handle_frame(frame: Dict[str, Any]) -> None:
     ]
     last_status["threat_history"] = list(reversed(threat_urls))
 
-    # persist blacklist
     try:
         with open(DANGER_LIST_FILE, "w") as f:
             json.dump(sorted(list(dangerous_persons)), f, indent=2)
     except Exception:
         pass
 
+# This part is made from GPT 
 
 @app.route("/frame_result", methods=["POST"])
 def frame_result():
@@ -448,8 +441,6 @@ def danger_list_route():
 
     return jsonify({"status": "ok", "dangerous_persons": sorted(list(dangerous_persons))})
 
-
-# Register dashboard blueprint/routes
 register_dashboard_routes(app)
 
 if __name__ == "__main__":

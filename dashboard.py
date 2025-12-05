@@ -1,4 +1,4 @@
-# dashboard.py
+# dashboard.py made from GPT
 from flask import render_template
 
 def register_dashboard_routes(app):

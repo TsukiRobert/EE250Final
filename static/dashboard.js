@@ -1,4 +1,4 @@
-// dashboard.js
+// dashboard.js This is made from GPT 
 
 let eventTypeChart = null;
 
