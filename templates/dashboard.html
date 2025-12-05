@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Smart Door Surveillance Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<div class="page">
+
+    <header class="topbar">
+        <h1>Smart Door Surveillance Dashboard</h1>
+        <span class="badge">EE250 Final Project</span>
+    </header>
+
+    <main class="grid">
+
+        <!-- LIVE STATUS -->
+        <section id="livePanel" class="card live-card">
+            <div class="card-header">
+                <h2>Live Status</h2>
+                <button class="btn" onclick="ackAlert()">Acknowledge Alert</button>
+            </div>
+            <div class="live-body">
+                <div class="live-text">
+                    <p id="currentState" class="state-line"></p>
+                    <p id="latestCaption" class="caption-line"></p>
+                </div>
+                <div class="live-image">
+                    <img id="threatImage" class="snapshot" style="display:none;">
+                    <div id="threatMeta" class="threat-meta"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TIMELINE -->
+        <section class="card timeline-card">
+            <div class="card-header">
+                <h2>Event Timeline</h2>
+            </div>
+            <div id="timelineContainer" class="timeline"></div>
+            <div class="timeline-legend">
+                <span class="dot visitor"></span> Visitor
+                <span class="dot delivery"></span> Delivery
+                <span class="dot threat"></span> Threat
+            </div>
+        </section>
+
+        <!-- ANALYTICS -->
+        <section class="card chart-card">
+            <div class="card-header">
+                <h2>Event Analytics</h2>
+            </div>
+            <canvas id="eventTypeChart"></canvas>
+        </section>
+
+        <!-- RECENT EVENTS TABLE -->
+        <section class="card table-card">
+            <div class="card-header">
+                <h2>Recent Events</h2>
+            </div>
+            <div class="table-wrapper">
+                <table id="eventTable" class="event-table">
+                    <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Type</th>
+                        <th>Start</th>
+                        <th>End</th>
+                        <th>Duration (s)</th>
+                        <th>Caption</th>
+                    </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- DANGEROUS PERSONS -->
+        <section class="card danger-card">
+            <div class="card-header">
+                <h2>Dangerous Persons</h2>
+            </div>
+            <div id="dangerList" class="danger-list"></div>
+            <div class="danger-controls">
+                <input id="dangerName" placeholder="Name to remove">
+                <button class="btn-outline" onclick="removeDanger()">Remove</button>
+            </div>
+        </section>
+    </main>
+</div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>
