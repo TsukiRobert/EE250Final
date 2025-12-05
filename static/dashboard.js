@@ -2,12 +2,10 @@
 
 let eventTypeChart = null;
 
-// ========== 1. LIVE STATUS ==========
 async function fetchStatus() {
     const res = await fetch("/latest_status");
     const data = await res.json();
 
-    // state
     const stateDiv = document.getElementById("currentState");
     stateDiv.innerHTML = `<span class="label">State:</span> <span class="value">${data.current_state}</span>`;
 

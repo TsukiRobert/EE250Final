@@ -1,13 +1,10 @@
 # server.py
-
 from flask import Flask, request, jsonify, send_from_directory
-import os
-import base64
-import json
+import os, json, base64
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import Dict, Any, List
 
-# === Load config ===
+from dashboard import register_dashboard_routes
 from config import (
     EVENTS_DIR,
     TMP_DIR,
@@ -16,17 +13,60 @@ from config import (
     BOX_THRESH,
     WEAPON_THRESH,
     WEAPON_CLASSES,
-    THREAT_MIN_DURATION_SEC,
-    THREAT_COOLDOWN_SEC,
+    THREAT_MIN_DURATION_SEC,   # not used in this simplified version but kept for config compatibility
+    THREAT_COOLDOWN_SEC,       # not used here either
 )
 
-# === Dashboard HTML routes ===
-from dashboard import register_dashboard_routes
+app = Flask(__name__)
+os.makedirs(EVENTS_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
 
+event_history: List[Dict[str, Any]] = []
+next_event_id = 1
 
-# ============================================================
-#                       Helper Functions
-# ============================================================
+# names that have ever been seen (for "new_person" flag)
+known_person_ids: set[str] = set()
+
+# blacklist
+dangerous_persons: set[str] = set()
+if os.path.exists(DANGER_LIST_FILE):
+    try:
+        dangerous_persons = set(json.load(open(DANGER_LIST_FILE)))
+    except Exception:
+        dangerous_persons = set()
+
+# what the dashboard & client see as "latest status"
+last_status: Dict[str, Any] = {
+    "current_state": "idle",          # idle | event_active | threat_active
+    "danger": False,
+    "needs_attention": False,
+
+    "last_event_id": None,
+    "last_event_type": None,
+    "last_event_caption": None,
+    "last_event_severity": "normal",
+    "latest_snapshot_url": None,
+
+    # live caption for the *current* frame
+    "live_caption": None,
+
+    # real-time threat info
+    "threat_flag": False,            # True if current frame has a weapon
+    "threat_image": None,            # URL of snapshot (for dashboard)
+    "threat_name": None,             # e.g. "Bob" or "danger_7"
+
+    # new-person + snapshot back to YOLO client
+    "new_person": False,             # True if this is first time we saw this person_id
+    "person_id": None,               # name or synthetic id
+    "person_snapshot_b64": None,     # base64 of snapshot (only when new_person=True)
+
+    # snapshot that caused this threat (always base64 when threat_flag=True)
+    "threat_snapshot_b64": None,
+
+    # threat history: list of snapshot URLs for all threat events
+    "threat_history": [],
+}
+
 
 def parse_iso(ts: str) -> datetime:
     try:
@@ -35,33 +75,32 @@ def parse_iso(ts: str) -> datetime:
         return datetime.utcnow()
 
 
-def normalize_person_list(person_info: Any) -> List[Dict[str, Any]]:
-    if person_info is None:
+def normalize_person_list(p):
+    if p is None:
         return []
-    if isinstance(person_info, list):
-        return [p for p in person_info if isinstance(p, dict)]
-    if isinstance(person_info, dict):
-        return [person_info]
+    if isinstance(p, list):
+        return [x for x in p if isinstance(x, dict)]
+    if isinstance(p, dict):
+        return [p]
     return []
 
 
-def compute_flags(detections: List[Dict[str, Any]]) -> Dict[str, bool]:
-    has_person = any(
-        d.get("class_name") == "person" and float(d.get("confidence", 0)) >= PERSON_THRESH
-        for d in detections
-    )
+def compute_flags(dets):
+    """Check for person / box / weapon."""
+    has_person = False
+    has_box = False
+    has_weapon = False
 
-    has_box = any(
-        d.get("class_name") in ("box", "package", "backpack")
-        and float(d.get("confidence", 0)) >= BOX_THRESH
-        for d in detections
-    )
+    for d in dets:
+        cname = d.get("class_name")
+        conf = float(d.get("confidence", 0.0))
 
-    has_weapon = any(
-        d.get("class_name") in WEAPON_CLASSES
-        and float(d.get("confidence", 0)) >= WEAPON_THRESH
-        for d in detections
-    )
+        if cname == "person" and conf >= PERSON_THRESH:
+            has_person = True
+        if cname in ("box", "backpack", "package") and conf >= BOX_THRESH:
+            has_box = True
+        if cname in WEAPON_CLASSES and conf >= WEAPON_THRESH:
+            has_weapon = True
 
     return {
         "has_person": has_person,
@@ -70,379 +109,301 @@ def compute_flags(detections: List[Dict[str, Any]]) -> Dict[str, bool]:
     }
 
 
-# ============================================================
-#                      Global State
-# ============================================================
+def compute_severity(flags, persons):
+    """normal / attention / danger for this frame's event."""
+    has_weapon = flags["has_weapon"]
+    has_person = flags["has_person"]
 
-app = Flask(__name__)
-os.makedirs(EVENTS_DIR, exist_ok=True)
+    if not has_weapon or not has_person:
+        return "normal"
 
-event_history: List[Dict[str, Any]] = []
-next_event_id: int = 1
-dangerous_persons: set[str] = set()
+    any_unknown = any(p.get("type") != "friend" for p in persons) if persons else True
+    any_blacklisted = any(
+        (p.get("name") or "").lower() in dangerous_persons
+        for p in persons
+        if p.get("name")
+    )
 
-camera_states: Dict[str, Dict[str, Any]] = {}
-camera_current_event = {}   
-
-EVENT_END_COOLDOWN = 2.0  # seconds after person disappears
-
-last_status: Dict[str, Any] = {
-    "current_state": "idle",
-    "danger": False,
-    "needs_attention": False,
-    "last_event_id": None,
-    "last_event_type": None,
-    "last_event_severity": "normal",
-    "last_event_caption": None,
-    "latest_snapshot_url": None,
-}
+    if any_unknown or any_blacklisted:
+        return "danger"
+    else:
+        return "attention"
 
 
-# ============================================================
-#                     Danger List Load/Save
-# ============================================================
-
-def load_danger_list():
-    global dangerous_persons
-    if os.path.exists(DANGER_LIST_FILE):
-        try:
-            with open(DANGER_LIST_FILE, "r", encoding="utf-8") as f:
-                dangerous_persons = {name.lower() for name in json.load(f)}
-        except:
-            dangerous_persons = set()
-
-def save_danger_list():
-    with open(DANGER_LIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(dangerous_persons), f, indent=2)
-
-load_danger_list()
+def objects_summary_from(flags, persons):
+    person_count = len(persons) if persons else (1 if flags["has_person"] else 0)
+    return {
+        "person_count": person_count,
+        "box": flags["has_box"],
+        "weapon": flags["has_weapon"],
+    }
 
 
-def allocate_event_id() -> int:
+def describe_event_like(persons, objs, severity):
+    """Same caption logic used for events and live status."""
+    has_weapon = objs["weapon"]
+    has_box = objs["box"]
+    num_people = objs["person_count"]
+
+    friend_names = [p.get("name") for p in persons if p.get("type") == "friend" and p.get("name")]
+    num_unknown = sum(1 for p in persons if p.get("type") != "friend")
+
+    # Threat
+    if has_weapon:
+        if severity == "danger":
+            if num_unknown >= 1:
+                return "An unknown person is holding a weapon. DANGER."
+            if friend_names:
+                return f"Your friend {friend_names[0]} is holding a weapon. DANGER."
+            return "Someone is holding a weapon. DANGER."
+        else:
+            if friend_names:
+                return f"Your friend {friend_names[0]} is holding a potential weapon. Pay attention."
+            return "Someone is holding a potential weapon. Pay attention."
+
+    # Delivery
+    if has_box:
+        if friend_names:
+            return f"Your friend {friend_names[0]} is delivering a package."
+        if num_unknown >= 1:
+            return "Someone is delivering a package."
+        return "A package is at your door."
+
+    # Visitor
+    if num_people >= 1:
+        if friend_names:
+            return f"Your friend {friend_names[0]} is standing at your door."
+        if num_unknown == 1:
+            return "An unknown person is standing at your door."
+        if num_unknown > 1:
+            return "Multiple unknown people are standing at your door."
+
+    return "No one is at your door."
+
+
+def decide_event_type(flags):
+    if not flags["has_person"]:
+        return None
+    if flags["has_weapon"]:
+        return "threat"
+    if flags["has_box"]:
+        return "delivery"
+    return "visitor"
+
+
+def next_id() -> int:
     global next_event_id
     eid = next_event_id
     next_event_id += 1
     return eid
 
 
-def get_camera_state(cid: str) -> Dict[str, Any]:
-    if cid not in camera_states:
-        camera_states[cid] = {
-            "threat_state": "none",
-            "threat_start_time": None,
-            "last_no_weapon_time": None,
-        }
-    return camera_states[cid]
+def handle_frame(frame: Dict[str, Any]) -> None:
+    """
+    1 frame in  ->  0/1 event appended to event_history
+    Also updates last_status (live state, captions, threat flag, snapshots).
+    """
+    global event_history, last_status, known_person_ids, dangerous_persons
 
+    ts = parse_iso(frame["timestamp"])
+    detections = frame.get("detections", [])
+    persons = normalize_person_list(frame.get("person_info"))
+    flags = compute_flags(detections)
+    objs = objects_summary_from(flags, persons)
+    severity = compute_severity(flags, persons)
+    live_caption = describe_event_like(persons, objs, severity)
+    event_type = decide_event_type(flags)
 
-# ============================================================
-#                    Build Event + Captions
-# ============================================================
-
-def build_event(camera_id, event_type, ts, frame_record, flags):
-    eid = allocate_event_id()
-    
-    # Save snapshot
-    snapshot_rel = None
-    if frame_record.get("image_path"):
-        src = frame_record["image_path"]
-        ext = os.path.splitext(src)[1] or ".jpg"
-        dest = os.path.join(EVENTS_DIR, f"event_{eid}{ext}")
-        try:
-            with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
-                fdst.write(fsrc.read())
-            snapshot_rel = f"/events/img/event_{eid}{ext}"
-        except:
-            snapshot_rel = None
-
-    persons = normalize_person_list(frame_record.get("person_info"))
-    flagsum = {
-        "person_count": len(persons) if persons else (1 if flags["has_person"] else 0),
-        "box": flags["has_box"],
-        "weapon": flags["has_weapon"],
-    }
-
-    # Determine severity
-    severity = "normal"
-    if flags["has_weapon"]:
-        any_unknown = any(p.get("type") != "friend" for p in persons) if persons else True
-        any_blacklisted = any(
-            (p.get("name") or "").lower() in dangerous_persons
-            for p in persons if p.get("name")
-        )
-        if any_unknown or any_blacklisted:
-            severity = "danger"
-        else:
-            severity = "attention"
-
-    event = {
-        "event_id": eid,
-        "camera_id": camera_id,
-        "event_type": event_type,
-        "start_time": ts.isoformat(),
-        "end_time": ts.isoformat(),
-        "duration_sec": 0.0,
-        "objects_summary": flagsum,
-        "person_info": persons,
-        "severity": severity,
-        "snapshot_path": snapshot_rel,
-    }
-    return event
-
-
-def describe_event(ev):
-    persons = normalize_person_list(ev["person_info"])
-    obj = ev["objects_summary"]
-    severity = ev["severity"]
-
-    P = persons
-    has_weapon = obj["weapon"]
-    has_box = obj["box"]
-
-    friend_names = [p["name"] for p in P if p.get("type") == "friend" and p.get("name")]
-    num_unknown = sum(1 for p in P if p.get("type") != "friend")
-
-    # weapon case
-    if has_weapon:
-        if severity == "danger":
-            if num_unknown:
-                return "An unknown person is at your door and appears to be holding a weapon. DANGER."
-            if friend_names:
-                return f"Your friend {friend_names[0]} has been marked as dangerous and is holding a weapon. DANGER."
-            return "Someone holding a weapon is at your door. DANGER."
-        else:
-            # attention
-            if friend_names:
-                return f"Your friend {friend_names[0]} is at your door holding a potential weapon."
-            return "Someone familiar is holding a potential weapon at your door."
-
-    # box case
-    if has_box:
-        if friend_names:
-            return f"Your friend {friend_names[0]} is delivering a package at your door."
-        return "Someone is delivering a package at your door."
-
-    # visitor
+    person_key = None
     if persons:
-        if friend_names:
-            return f"Your friend {friend_names[0]} is standing at your door."
-        return "An unknown person is standing at your door."
+        p0 = persons[0]
+        if p0.get("name"):
+            person_key = p0["name"].lower()
 
-    return "No one is at your door."
+    new_person = False
+    snapshot_rel_path = None
+    snapshot_b64 = None
+    new_event: Dict[str, Any] | None = None
 
+    if event_type is not None:
+        eid = next_id()
 
-# ============================================================
-#                  Threat State Machine (UPDATED)
-# ============================================================
-def process_frame(frame_record):
-    cid = frame_record["camera_id"]
-    ts = parse_iso(frame_record["timestamp"])
-    flags = compute_flags(frame_record["detections"])
+        img_src = frame.get("image_path")
+        dest = None
+        if img_src:
+            ext = os.path.splitext(img_src)[1] or ".jpg"
+            dest = os.path.join(EVENTS_DIR, f"event_{eid}{ext}")
+            try:
+                with open(img_src, "rb") as fsrc, open(dest, "wb") as fdst:
+                    fdst.write(fsrc.read())
+                snapshot_rel_path = f"/events/img/event_{eid}{ext}"
+                with open(dest, "rb") as f:
+                    snapshot_b64 = base64.b64encode(f.read()).decode("ascii")
+            except Exception:
+                snapshot_rel_path = None
+                snapshot_b64 = None
 
-    has_person = flags["has_person"]
-    has_weapon = flags["has_weapon"]
-    has_box = flags["has_box"]
-    persons = normalize_person_list(frame_record["person_info"])
-
-    # access event state machine
-    state = get_camera_state(cid)
-
-    # The event we are building for logging
-    new_event = None
-    current_state = "idle"
-
-    # -----------------------------------------------------------
-    #              THREAT STATE MACHINE (unchanged)
-    # -----------------------------------------------------------
-    if has_person and has_weapon:
-
-        if state["threat_state"] == "none":
-            state["threat_state"] = "arming"
-            state["threat_start_time"] = ts
-            state["last_no_weapon_time"] = None
-            current_state = "event_active"
-            return current_state, None
-
-        if state["threat_state"] == "arming":
-            dur = (ts - state["threat_start_time"]).total_seconds()
-            if dur >= THREAT_MIN_DURATION_SEC:
-                state["threat_state"] = "active"
-                new_event = build_event(cid, "threat", ts, frame_record, flags)
-                new_event["start_time"] = state["threat_start_time"].isoformat()
-                new_event["end_time"] = ts.isoformat()
-                return "threat_active", new_event
-            return "event_active", None
-
-        if state["threat_state"] == "active":
-            state["last_no_weapon_time"] = None
-            return "threat_active", None
-
-    # -----------------------------------------------------------
-    #                THREAT COOLDOWN / EXIT
-    # -----------------------------------------------------------
-    if state["threat_state"] in ("arming", "active"):
-        if state["last_no_weapon_time"] is None:
-            state["last_no_weapon_time"] = ts
-        else:
-            cd = (ts - state["last_no_weapon_time"]).total_seconds()
-            if cd >= THREAT_COOLDOWN_SEC:
-                state["threat_state"] = "none"
-                state["threat_start_time"] = None
-                state["last_no_weapon_time"] = None
-
-        if state["threat_state"] == "active":
-            current_state = "threat_active"
-            # Threat ongoing → but still allow normal events to log
-        else:
-            current_state = "event_active"
-    else:
-        current_state = "idle"
-
-    # -----------------------------------------------------------
-    #                  NORMAL EVENT MERGING (NEW)
-    # -----------------------------------------------------------
-    ongoing = camera_current_event.get(cid)
-
-    if has_person:
-        # determine event type
-        if has_box:
-            etype = "delivery"
-        else:
-            etype = "visitor"
-
-        if ongoing is None:
-            # NEW EVENT START
-            ongoing = build_event(cid, etype, ts, frame_record, flags)
-            ongoing["start_time"] = ts.isoformat()
-            ongoing["end_time"] = ts.isoformat()
-            ongoing["cooldown_start"] = None
-            camera_current_event[cid] = ongoing
-            return current_state, None
-
-        else:
-            # SAME PERSON STILL PRESENT → extend event
-            ongoing["end_time"] = ts.isoformat()
-            ongoing["cooldown_start"] = None
-            return current_state, None
-
-    else:
-        # No person → close event if cooldown passes
-        if ongoing:
-            if ongoing.get("cooldown_start") is None:
-                ongoing["cooldown_start"] = ts
-                return current_state, None
-            else:
-                cd = (ts - ongoing["cooldown_start"]).total_seconds()
-                if cd >= EVENT_END_COOLDOWN:
-                    # finalize event
-                    ongoing["duration_sec"] = (
-                        parse_iso(ongoing["end_time"]) -
-                        parse_iso(ongoing["start_time"])
-                    ).total_seconds()
-
-                    finished = ongoing
-                    camera_current_event[cid] = None
-                    return current_state, finished
-
-        return current_state, None
-
-# ============================================================
-#                   Status + Event Update
-# ============================================================
-
-def update_last_status(current_state, new_event):
-    if new_event:
+        new_event = {
+            "event_id": eid,
+            "event_type": event_type,
+            "start_time": ts.isoformat(),
+            "end_time": ts.isoformat(),
+            "duration_sec": 0.0,
+            "severity": severity,
+            "objects_summary": objs,
+            "person_info": persons,
+            "snapshot_path": snapshot_rel_path,
+            "caption": live_caption,
+        }
         event_history.append(new_event)
 
-        cap = describe_event(new_event)
-        new_event["caption"] = cap
+        last_status["last_event_id"] = eid
+        last_status["last_event_type"] = event_type
+        last_status["last_event_caption"] = live_caption
+        last_status["last_event_severity"] = severity
+        last_status["latest_snapshot_url"] = snapshot_rel_path
 
-        sev = new_event["severity"]
-        last_status["last_event_id"] = new_event["event_id"]
-        last_status["last_event_type"] = new_event["event_type"]
-        last_status["last_event_severity"] = sev
-        last_status["last_event_caption"] = cap
-        last_status["latest_snapshot_url"] = new_event.get("snapshot_path")
+        if person_key:
+            if person_key not in known_person_ids:
+                known_person_ids.add(person_key)
+                new_person = True
 
-        if sev == "danger":
+    if flags["has_weapon"]:
+        last_status["current_state"] = "threat_active"
+    elif flags["has_person"]:
+        last_status["current_state"] = "event_active"
+    else:
+        last_status["current_state"] = "idle"
+
+    last_status["live_caption"] = live_caption
+
+    last_status["threat_flag"] = flags["has_weapon"]
+
+    if flags["has_weapon"]:
+        if new_event is not None:
+            last_status["threat_image"] = new_event.get("snapshot_path")
+        else:
+            last_status["threat_image"] = None
+
+
+        name = None
+        for p in persons:
+            if p.get("name"):
+                name = p["name"]
+                break
+
+        if name:
+            last_status["threat_name"] = name
+            dangerous_persons.add(name.lower())
+        else:
+            synthetic = f"danger_{last_status['last_event_id'] or int(ts.timestamp())}"
+            last_status["threat_name"] = synthetic
+            dangerous_persons.add(synthetic)
+
+        # severity → dashboard flags
+        if severity == "danger":
             last_status["danger"] = True
-            last_status["needs_attention"] = False
-        elif sev == "attention" and not last_status["danger"]:
+        elif severity == "attention" and not last_status["danger"]:
             last_status["needs_attention"] = True
+    else:
+        last_status["threat_image"] = None
+        last_status["threat_name"] = None
 
-    last_status["current_state"] = current_state
+    last_status["new_person"] = new_person
+    last_status["person_id"] = person_key
+    last_status["person_snapshot_b64"] = snapshot_b64 if new_person else None
 
+    if last_status["threat_flag"]:
+        last_status["threat_snapshot_b64"] = snapshot_b64
+    else:
+        last_status["threat_snapshot_b64"] = None
 
-# ============================================================
-#                          Routes
-# ============================================================
+    threat_urls = [
+        ev["snapshot_path"]
+        for ev in event_history
+        if ev.get("event_type") == "threat" and ev.get("snapshot_path")
+    ]
+    last_status["threat_history"] = list(reversed(threat_urls))
 
-@app.post("/detections")
-def detections():
-    frames = request.get_json(force=True)
-    if not isinstance(frames, list):
-        return {"status": "error", "msg": "Expected list"}, 400
-
-    return {"events": frames}
+    # persist blacklist
+    try:
+        with open(DANGER_LIST_FILE, "w") as f:
+            json.dump(sorted(list(dangerous_persons)), f, indent=2)
+    except Exception:
+        pass
 
 
 @app.route("/frame_result", methods=["POST"])
 def frame_result():
-    data = request.get_json(force=True)
+    """
+    Entry point for your YOLO client.
+    Expects JSON:
+      {
+        "camera_id": "...",
+        "frame_id": ...,
+        "timestamp": "...",
+        "detections": [...],
+        "person_info": {...} or [...],
+        "image_jpeg_base64": "..."     # optional (OR "image")
+      }
+    Returns `last_status` which includes threat_flag, threat_name,
+    threat_snapshot_b64, new_person, person_snapshot_b64, threat_history, etc.
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "invalid JSON"}), 400
 
-    cid = data.get("camera_id", "cam1")
-    frame_id = data.get("frame_id")
-    ts = data.get("timestamp") or datetime.utcnow().isoformat() + "Z"
-    dets = data.get("detections", [])
-    pinfo = data.get("person_info", None)
+    # Accept both "image_jpeg_base64" and "image" (your friend's field)
+    img_b64 = data.get("image_jpeg_base64") or data.get("image")
 
+    # Save raw image (optional)
     image_path = None
-    if data.get("image_jpeg_base64"):
+    if img_b64:
         try:
-            raw = base64.b64decode(data["image_jpeg_base64"])
-            fname = f"latest_{cid}.jpg"
+            raw = base64.b64decode(img_b64)
+            fname = f"latest_{data.get('camera_id', 'cam')}.jpg"
             image_path = os.path.join(TMP_DIR, fname)
             with open(image_path, "wb") as f:
                 f.write(raw)
-        except:
+        except Exception:
             image_path = None
 
-    fr = {
-        "camera_id": cid,
-        "frame_id": frame_id,
-        "timestamp": ts,
-        "detections": dets,
-        "person_info": pinfo,
+    frame = {
+        "camera_id": data.get("camera_id", "cam"),
+        "frame_id": data.get("frame_id"),
+        "timestamp": data.get("timestamp") or datetime.utcnow().isoformat() + "Z",
+        "detections": data.get("detections", []),
+        "person_info": data.get("person_info"),
         "image_path": image_path,
-        "image_meta": data.get("image_meta", {}),
     }
 
-    state, ne = process_frame(fr)
-    update_last_status(state, ne)
-
+    handle_frame(frame)
     return jsonify(last_status)
 
 
 @app.route("/latest_status")
-def latest_status_api():
+def latest_status_route():
     return jsonify(last_status)
 
 
 @app.route("/events")
-def events_api():
-    N = int(request.args.get("limit", 50))
+def events_route():
+    N = int(request.args.get("limit", 100))
+    subset = event_history[-N:]
     out = []
-    for ev in event_history[-N:]:
-        out.append({
-            "event_id": ev["event_id"],
-            "event_type": ev["event_type"],
-            "start_time": ev["start_time"],
-            "end_time": ev["end_time"],
-            "severity": ev["severity"],
-            "caption": ev["caption"],
-            "person_info": ev["person_info"],
-            "snapshot_url": ev["snapshot_path"]
-        })
+    for ev in subset:
+        out.append(
+            {
+                "event_id": ev["event_id"],
+                "event_type": ev["event_type"],
+                "start_time": ev["start_time"],
+                "end_time": ev["end_time"],
+                "duration_sec": ev["duration_sec"],
+                "severity": ev["severity"],
+                "caption": ev.get("caption"),
+                "snapshot_url": ev.get("snapshot_path"),
+            }
+        )
     return jsonify(out)
 
 
@@ -452,41 +413,44 @@ def event_img(fn):
 
 
 @app.route("/ack_alert", methods=["POST"])
-def ack_alert():
+def ack():
+    # Clear current warning/attention but keep history
     last_status["danger"] = False
     last_status["needs_attention"] = False
-    return {"status": "ok"}
+    last_status["threat_flag"] = False
+    last_status["threat_image"] = None
+    last_status["threat_name"] = None
+    last_status["threat_snapshot_b64"] = None
+    return jsonify({"status": "ok"})
 
 
 @app.route("/danger_list", methods=["GET", "POST"])
-def danger_list():
+def danger_list_route():
+    global dangerous_persons
     if request.method == "GET":
-        return {"dangerous_persons": sorted(dangerous_persons)}
+        return jsonify({"dangerous_persons": sorted(list(dangerous_persons))})
 
-    data = request.get_json(force=True)
-    action = data.get("action")
+    data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip().lower()
-
     if not name:
-        return {"status": "error", "error": "name required"}, 400
+        return jsonify({"error": "name required"}), 400
 
-    if action == "add":
-        dangerous_persons.add(name)
-        save_danger_list()
-
-    elif action == "remove":
+    if data.get("action") == "remove":
         dangerous_persons.discard(name)
-        save_danger_list()
-
     else:
-        return {"status": "error", "error": "invalid action"}, 400
+        dangerous_persons.add(name)
 
-    return {"status": "ok", "dangerous_persons": sorted(dangerous_persons)}
+    try:
+        with open(DANGER_LIST_FILE, "w") as f:
+            json.dump(sorted(list(dangerous_persons)), f, indent=2)
+    except Exception:
+        pass
+
+    return jsonify({"status": "ok", "dangerous_persons": sorted(list(dangerous_persons))})
 
 
-# attach dashboard
+# Register dashboard blueprint/routes
 register_dashboard_routes(app)
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
